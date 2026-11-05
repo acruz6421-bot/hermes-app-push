@@ -871,21 +871,35 @@ def test_one_board_watcher_for_every_profile_copy(copies, tmp_path):
 
 
 def test_reads_never_take_the_write_lock(copies, tmp_path, monkeypatch):
-    import fcntl
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+        import msvcrt
     core = copies("app_push_reads")
     store_module = sys.modules["app_push_reads.store"]
     store = core.Store(tmp_path, lock_timeout=0.3)
     store.put_device("dev-reader", {"token": "ab" * 16, "preferences": {}})
     store.open_request("req-1", {"kind": "approval", "session": "s"})
     calls = []
-    real_flock = fcntl.flock
-    recording = types.SimpleNamespace(LOCK_EX=fcntl.LOCK_EX, LOCK_SH=fcntl.LOCK_SH, LOCK_NB=fcntl.LOCK_NB,
-                                      LOCK_UN=fcntl.LOCK_UN,
-                                      flock=lambda fd, op: (calls.append(op), real_flock(fd, op))[1])
-    monkeypatch.setattr(store_module, "fcntl", recording)
+    if fcntl is not None:
+        real_flock = fcntl.flock
+        recording = types.SimpleNamespace(LOCK_EX=fcntl.LOCK_EX, LOCK_SH=fcntl.LOCK_SH, LOCK_NB=fcntl.LOCK_NB,
+                                          LOCK_UN=fcntl.LOCK_UN,
+                                          flock=lambda fd, op: (calls.append(op), real_flock(fd, op))[1])
+        monkeypatch.setattr(store_module, "fcntl", recording)
+    else:
+        real_locking = msvcrt.locking
+        recording = types.SimpleNamespace(LK_NBLCK=msvcrt.LK_NBLCK, LK_UNLCK=msvcrt.LK_UNLCK,
+                                          locking=lambda fd, mode, n: (calls.append(mode), real_locking(fd, mode, n))[1])
+        monkeypatch.setattr(store_module, "msvcrt", recording)
     # Another process (or a stuck thread) holds the write lock.
     with open(store.lock_path, "a+") as holder:
-        real_flock(holder, fcntl.LOCK_EX)
+        if fcntl is not None:
+            real_flock(holder, fcntl.LOCK_EX)
+        else:
+            holder.seek(0)
+            real_locking(holder.fileno(), msvcrt.LK_NBLCK, 1)
         started = time.monotonic()
         assert "dev-reader" in store.devices() and "req-1" in store.open_requests()
         assert store.read()["devices"] and store.presence("dev-reader") is None
@@ -896,8 +910,13 @@ def test_reads_never_take_the_write_lock(copies, tmp_path, monkeypatch):
         with pytest.raises(store_module.StoreBusy):
             store.put_device("dev-blocked", {"token": "cd" * 16})
         assert 0.25 <= time.monotonic() - started < 2
-        assert calls and all(op & fcntl.LOCK_NB for op in calls if op != fcntl.LOCK_UN)
-        real_flock(holder, fcntl.LOCK_UN)
+        if fcntl is not None:
+            assert calls and all(op & fcntl.LOCK_NB for op in calls if op != fcntl.LOCK_UN)
+            real_flock(holder, fcntl.LOCK_UN)
+        else:
+            assert calls and all(op == msvcrt.LK_NBLCK for op in calls if op != msvcrt.LK_UNLCK)
+            holder.seek(0)
+            real_locking(holder.fileno(), msvcrt.LK_UNLCK, 1)
     store.put_device("dev-after", {"token": "ef" * 16})
     assert set(store.devices()) == {"dev-reader", "dev-after"}
     # Readers racing a busy writer only ever see a whole file.
