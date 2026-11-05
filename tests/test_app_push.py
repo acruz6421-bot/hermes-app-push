@@ -955,6 +955,53 @@ def test_an_unchanged_state_is_never_rewritten(copies, tmp_path, monkeypatch):
     assert store.path.stat().st_ino != first.st_ino  # an atomic replace
 
 
+def test_windows_permission_error_retry_and_exhaustion_cleanup(copies, tmp_path, monkeypatch):
+    core = copies("app_push_win_replace")
+    store_module = sys.modules["app_push_win_replace.store"]
+    store = core.Store(tmp_path, lock_timeout=0.05)
+    store.update(lambda s: s.__setitem__("card_cursors", {"default": 1}))
+
+    real_replace = os.replace
+    attempts = {"n": 0}
+
+    def flaky_replace(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] <= 2:
+            raise PermissionError(13, "WinError 5: Access is denied", str(src), 5, str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(store_module.os, "name", "nt", raising=False)
+    monkeypatch.setattr(store_module.os, "replace", flaky_replace)
+    store.update(lambda s: s.__setitem__("card_cursors", {"default": 2}))
+    assert attempts["n"] == 3
+    assert store.read()["card_cursors"] == {"default": 2}
+
+    # Persistent PermissionError past lock_timeout raises, preserves state, and cleans up .state-* tmp file.
+    def always_denied(src, dst):
+        raise PermissionError(13, "WinError 5: Access is denied", str(src), 5, str(dst))
+
+    monkeypatch.setattr(store_module.os, "replace", always_denied)
+    with pytest.raises(PermissionError):
+        store.update(lambda s: s.__setitem__("card_cursors", {"default": 99}))
+    assert store.read()["card_cursors"] == {"default": 2}
+    assert list(tmp_path.glob(".state-*")) == []
+
+    # On non-Windows hosts, PermissionError propagates immediately on the first attempt.
+    posix_attempts = {"n": 0}
+
+    def posix_denied(src, dst):
+        posix_attempts["n"] += 1
+        raise PermissionError(13, "Permission denied", str(src), None, str(dst))
+
+    monkeypatch.setattr(store_module.os, "name", "posix", raising=False)
+    monkeypatch.setattr(store_module.os, "replace", posix_denied)
+    with pytest.raises(PermissionError):
+        store.update(lambda s: s.__setitem__("card_cursors", {"default": 100}))
+    assert posix_attempts["n"] == 1
+    assert store.read()["card_cursors"] == {"default": 2}
+    assert list(tmp_path.glob(".state-*")) == []
+
+
 def test_quiet_boards_and_tidies_cost_no_lock_and_no_write(hermes, monkeypatch):
     """The watcher's steady state: a lock-free read per look, no flock, no rewrite of the state file."""
     _, handler = hermes
